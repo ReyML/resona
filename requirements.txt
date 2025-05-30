@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-multipart
+yt-dlp
+librosa
+# For Firebase integration (add later when setting up Firebase)
+# firebase-admin
+# numpy # librosa dependency, often good to specify
+
+# DEV notes:
+# To run: uvicorn main:app --reload
+# yt-dlp requires ffmpeg to be installed on the system for some operations. 
+# librosa requires ffmpeg to be installed on the system for some operations. 
+# ffmpeg is required for yt-dlp and librosa to work. 
+# ffmpeg is required for yt-dlp and librosa to work. 
