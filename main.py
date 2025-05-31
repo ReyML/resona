@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Body
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -77,8 +77,9 @@ async def read_root():
     return {"message": f"Welcome to the RESONA API. Visit /{STATIC_DIR}/index.html for the app."}
 
 @app.post("/api/analyze-segment", response_model=AnalysisResponse)
-async def analyze_youtube_segment_endpoint(youtube_url: str = Form(...)):
-    print(f"API: Received YouTube URL: {youtube_url}")
+async def analyze_youtube_segment_endpoint(request_data: SegmentAnalysisRequest = Body(...)):
+    youtube_url = request_data.youtube_url
+    print(f"API: Received YouTube URL via JSON: {youtube_url}")
     
     try:
         video_id, start_s, end_s = parse_youtube_url(youtube_url)
@@ -87,61 +88,42 @@ async def analyze_youtube_segment_endpoint(youtube_url: str = Form(...)):
 
         print(f"API: Parsed ID: {video_id}, Start: {start_s}s, End: {end_s}s")
         
-        # Download the segment
-        # download_youtube_segment can raise ValueError or HTTPException
         download_info = download_youtube_segment(video_id, start_s, end_s)
         
         if not download_info or not download_info.get("file_path"):
-            # This case should ideally be covered by exceptions in download_youtube_segment
             raise HTTPException(status_code=500, detail="Failed to download or process YouTube segment.")
 
         print(f"API: Segment downloaded: {download_info.get('file_path')}")
 
-        # Create SegmentInfo for the source/downloaded segment
         source_segment = SegmentInfo(
-            id=f"yt_{video_id}_{start_s if start_s is not None else 0}_{end_s if end_s is not None else 'end'}", # Unique ID for the segment
+            id=f"yt_{video_id}_{start_s if start_s is not None else 0}_{end_s if end_s is not None else 'end'}",
             title=download_info.get("title", "Unknown Title"),
             artist=download_info.get("artist", "Unknown Artist"),
             youtube_link=download_info.get("original_url", youtube_url),
             thumbnail_url=download_info.get("thumbnail_url"),
             segment_display_time=download_info.get("segment_display_time", "N/A"),
-            matched_features=["YouTube Segment", f"Duration: {(end_s if end_s else 0) - (start_s if start_s else 0)}s"] # Example features
-            # similarity_score is not applicable for source segment
+            matched_features=["YouTube Segment", f"Duration: {(end_s if end_s else 0) - (start_s if start_s else 0)}s"]
         )
-
-        # --- Placeholder for audio feature extraction and similarity search --- 
-        # 1. Call audio_processor.extract_segment_features(download_info["file_path"])
-        #    This would return a feature vector (e.g., MFCCs, embeddings).
-        #    features = extract_segment_features(download_info["file_path"])
-        # 2. Call firebase_service.save_segment_to_db(source_segment, features) (optional, if storing all processed)
-        # 3. Call firebase_service.find_similar_segments_in_db(features)
-        #    This would return a list of similar SegmentInfo objects from your database.
-        #    similar_segments_from_db = find_similar_segments_in_db(features)
         
-        # For now, using placeholder similar segments:
         similar_segments_placeholder = [
             SegmentInfo(
                 id="similar_abc_placeholder", 
                 title="Placeholder Similar Song 1", 
                 artist="Demo Artist", 
                 youtube_link="https://www.youtube.com/watch?v=placeholder1",
-                thumbnail_url="https://via.placeholder.com/400x225/333/fff?text=Similar+1",
+                thumbnail_url="https://placehold.co/400x225/E81C4F/white?text=Similar+1&font=lora",
                 segment_display_time="01:00 - 01:30", 
                 matched_features=["Similar Tempo", "Vibey Horns"],
                 similarity_score=0.92
             )
         ]
-        # --- End Placeholder ---
 
-        # Clean up the downloaded audio file after processing (important!)
-        # We might move this to a background task or a finally block if feature extraction is long
         try:
             if os.path.exists(download_info["file_path"]):
                 os.remove(download_info["file_path"])
                 print(f"API: Cleaned up temporary file: {download_info['file_path']}")
         except Exception as e_clean:
             print(f"API: Error cleaning up file {download_info.get('file_path')}: {e_clean}")
-            # Not a critical error to stop the request, but log it.
 
         return AnalysisResponse(source_segment_info=source_segment, similar_segments=similar_segments_placeholder)
 
@@ -150,10 +132,9 @@ async def analyze_youtube_segment_endpoint(youtube_url: str = Form(...)):
         raise HTTPException(status_code=400, detail=str(ve))
     except HTTPException as he:
         print(f"API: HTTPException caught: {he.detail}")
-        raise # Re-raise if it's already an HTTPException
+        raise
     except Exception as e:
         print(f"API: Unexpected error in analyze_youtube_segment: {e}")
-        # Generic error for unexpected issues
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 @app.post("/api/analyze-audio", response_model=AnalysisResponse)
@@ -170,22 +151,17 @@ async def analyze_audio_file_endpoint(audio_file: UploadFile = File(...)):
     finally:
         audio_file.file.close()
 
-    # --- Placeholder for audio feature extraction and similarity search --- 
-    # 1. features = audio_processor.extract_segment_features(file_path)
-    # 2. similar_segments_from_db = firebase_service.find_similar_segments_in_db(features)
     source_info_placeholder = SegmentInfo(
         id=f"upload_{audio_file.filename.split('.')[0]}_{int(os.path.getmtime(file_path))}", 
         title=audio_file.filename, 
         artist="Uploaded Audio", 
         youtube_link="#", 
         thumbnail_url="https://via.placeholder.com/400x225/777/fff?text=Audio+File",
-        segment_display_time="Full duration", # Ideally, get duration using librosa here
+        segment_display_time="Full duration",
         matched_features=["Uploaded File", "Local Analysis"]
     )
     similar_segments_placeholder = [] 
-    # --- End Placeholder ---
     
-    # Clean up the uploaded audio file
     try:
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -197,10 +173,8 @@ async def analyze_audio_file_endpoint(audio_file: UploadFile = File(...)):
 
 # --- Main Execution Guard ---
 if __name__ == "__main__":
-    # Make sure 'static' directory exists and index.html is in it.
-    # A common setup is to have your index.html in a 'static' folder.
-    # If index.html is in the root, you might need to adjust StaticFiles or create a route for it.
     print("Starting Uvicorn server...")
     print(f"Frontend expected at: http://localhost:8000/{STATIC_DIR}/index.html")
     print(f"API docs available at: http://localhost:8000/docs")
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True) 
+    # Pass the app as an import string "filename:app_instance_name" for reload to work correctly
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 

@@ -1,183 +1,214 @@
 import yt_dlp
 import os
 import re
-from typing import Tuple, Optional, Dict
+from urllib.parse import urlparse, parse_qs
+import logging
+from typing import Tuple, Optional, Dict, Any
 
 TEMP_AUDIO_DIR = "temp_audio" # Should align with main.py or be passed as config
 
-def parse_youtube_url(youtube_url: str) -> Tuple[Optional[str], Optional[int], Optional[int]]:
-    """
-    Parses a YouTube URL to extract video ID, start time, and end time (if specified via t= or start=/end=).
-    Currently, only supports &t= seconds or &t=MmSs format.
-    A default duration of 30 seconds will be assumed if only a start time is provided.
-    Returns (video_id, start_seconds, end_seconds)
-    """
-    video_id_match = re.search(r"(?:v=|/embed/|/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})", youtube_url)
-    if not video_id_match:
-        return None, None, None
-    video_id = video_id_match.group(1)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-    start_seconds = None
-    end_seconds = None
-    default_duration = 30 # Default segment duration in seconds
+def parse_time_to_seconds(time_str: Optional[str]) -> Optional[int]:
+    if not time_str:
+        return None
+    if isinstance(time_str, int):
+        return time_str
+    if time_str.isdigit():
+        return int(time_str)
+    
+    match_s = re.match(r"(\d+)s$", time_str)
+    if match_s:
+        return int(match_s.group(1))
+    
+    match_ms = re.match(r"(\d+)m(\d+)s$", time_str)
+    if match_ms:
+        return int(match_ms.group(1)) * 60 + int(match_ms.group(2))
+        
+    match_hms = re.match(r"(\d+)h(\d+)m(\d+)s$", time_str)
+    if match_hms:
+        return int(match_hms.group(1)) * 3600 + int(match_hms.group(2)) * 60 + int(match_hms.group(3))
+    
+    logger.warning(f"Could not parse time string: {time_str}")
+    return None
 
-    # Regex for &t= or ?t=
-    time_match = re.search(r"[?&]t=([^&\s#]+)", youtube_url)
-    if time_match:
-        time_str = time_match.group(1)
-        if 'm' in time_str or 's' in time_str:
-            minutes = 0
-            seconds = 0
-            min_match = re.search(r"(\d+)m", time_str)
-            if min_match:
-                minutes = int(min_match.group(1))
-            sec_match = re.search(r"(\d+)s", time_str)
-            if sec_match:
-                seconds = int(sec_match.group(1))
-            start_seconds = (minutes * 60) + seconds
-        else:
-            try:
-                start_seconds = int(time_str)
-            except ValueError:
-                start_seconds = None # Invalid time format
+def parse_youtube_url(url_string: str) -> Tuple[str, int, int]:
+    parsed_url = urlparse(url_string)
+    query_params = parse_qs(parsed_url.query)
 
-    if start_seconds is not None:
-        end_seconds = start_seconds + default_duration
+    video_id = None
+    if "v" in query_params:
+        video_id = query_params["v"][0]
+    elif parsed_url.hostname == "youtu.be":
+        video_id = parsed_url.path[1:]
+    
+    if not video_id:
+        raise ValueError("Could not extract video ID from URL.")
+
+    start_seconds_user = None
+    if "t" in query_params:
+        start_seconds_user = parse_time_to_seconds(query_params["t"][0])
+
+    end_seconds_user = None
+    if "end" in query_params: # Using 'end' as a custom parameter for end time
+        end_seconds_user = parse_time_to_seconds(query_params["end"][0])
+
+    MAX_DURATION = 20
+    DEFAULT_DURATION = 20
+
+    start_seconds = 0
+    end_seconds = DEFAULT_DURATION
+
+    if start_seconds_user is not None:
+        start_seconds = start_seconds_user
+        if end_seconds_user is not None:
+            if end_seconds_user > start_seconds:
+                duration = end_seconds_user - start_seconds
+                if duration > MAX_DURATION:
+                    end_seconds = start_seconds + MAX_DURATION
+                else:
+                    end_seconds = end_seconds_user
+            else: # end time is invalid or not after start time
+                end_seconds = start_seconds + DEFAULT_DURATION 
+                # Cap if default duration makes it too long (shouldn't happen if MAX_DURATION=DEFAULT_DURATION)
+                # This case is mostly for clarity if MAX_DURATION and DEFAULT_DURATION differ
+                if (end_seconds - start_seconds) > MAX_DURATION:
+                     end_seconds = start_seconds + MAX_DURATION
+        else: # Only start time provided
+            end_seconds = start_seconds + DEFAULT_DURATION
+            if (end_seconds - start_seconds) > MAX_DURATION: # Should not exceed max if default is 20 and max is 20
+                end_seconds = start_seconds + MAX_DURATION
+    else: # No start time provided, use 0 to DEFAULT_DURATION
+        start_seconds = 0
+        end_seconds = DEFAULT_DURATION
+        # end_seconds_user could still be present if user provides ?end=10s but no t=
+        # This logic prioritizes 't' for segment start. If no 't', it's 0-20.
+        # If user provides ?end=10s but no t=, it's still 0-20s not 0-10s with current logic.
+        # This could be refined if we want `end` to work independently of `t` for 0-`end`.
+        # For now, `end` is only considered if `t` is also present.
+
+    # Ensure start_seconds is not negative
+    if start_seconds < 0:
+        start_seconds = 0
+        end_seconds = DEFAULT_DURATION # Recalculate end if start was negative
+
+    # Final check to ensure end_seconds is always greater than start_seconds after adjustments
+    if end_seconds <= start_seconds:
+        end_seconds = start_seconds + DEFAULT_DURATION # Fallback to default duration
+        if (end_seconds - start_seconds) > MAX_DURATION: # Ensure it still respects MAX_DURATION
+            end_seconds = start_seconds + MAX_DURATION
 
     return video_id, start_seconds, end_seconds
 
-def download_youtube_segment(video_id: str, start_seconds: Optional[int] = None, end_seconds: Optional[int] = None) -> Optional[Dict[str, any]]:
-    """
-    Downloads a specific segment of a YouTube video's audio.
-    If start_seconds and end_seconds are None, downloads a default 30s portion from the beginning.
-    Saves the audio to a temporary file and returns a dictionary with metadata including the file path.
-    """
-    if not os.path.exists(TEMP_AUDIO_DIR):
-        os.makedirs(TEMP_AUDIO_DIR)
+def download_youtube_segment(video_id: str, start_seconds: int, end_seconds: int, output_dir: str = TEMP_AUDIO_DIR) -> Dict[str, Any]:
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Sanitize video_id to prevent directory traversal or command injection issues
+    safe_video_id = re.sub(r'[^a-zA-Z0-9_\-]', '', video_id)
+    # Further safeguard against excessively long names, though yt-dlp might truncate anyway
+    safe_video_id = safe_video_id[:50] 
 
-    # Define a unique base for the output file, extension will be added by yt-dlp
-    # Cleaner approach: let yt-dlp name it, then retrieve actual name from info_dict
-    # For now, we'll use a predictable pattern and find it.
-    output_base = f"{video_id}_segment"
-    output_template_with_ext = os.path.join(TEMP_AUDIO_DIR, f"{output_base}.%(ext)s")
-    final_output_mp3 = os.path.join(TEMP_AUDIO_DIR, f"{output_base}.mp3") # Assuming mp3 output
+    output_template = os.path.join(output_dir, f"{safe_video_id}_segment.%(ext)s")
 
-    # Clean up previous segment file for the same video_id if it exists
-    if os.path.exists(final_output_mp3):
-        try:
-            os.remove(final_output_mp3)
-        except OSError as e:
-            print(f"Could not remove existing segment file {final_output_mp3}: {e}")
+    segment_duration = end_seconds - start_seconds
+    if segment_duration <= 0:
+        logger.warning(f"Segment duration for {video_id} is {segment_duration}s (start: {start_seconds}, end: {end_seconds}). FFmpeg requires positive duration. Setting to 1s.")
+        segment_duration = 1 # Prevent FFmpeg error with -t 0 or negative
 
     ydl_opts = {
         'format': 'bestaudio/best',
-        'outtmpl': output_template_with_ext,
-        'noplaylist': True,
-        'quiet': False,
-        'no_warnings': True,
+        'outtmpl': output_template,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '192',
         }],
-        'download_archive': os.path.join(TEMP_AUDIO_DIR, 'downloaded_archive.txt') # Avoid re-downloading issues
+        'postprocessor_args': [
+            '-ss', str(start_seconds),
+            '-t', str(segment_duration)
+        ],
+        'quiet': False, 
+        'no_warnings': False,
+        'noprogress': True,
+        'noplaylist': True, # Ensures only single video is downloaded if URL accidentally points to a playlist
     }
 
-    actual_start_seconds = start_seconds
-    actual_end_seconds = end_seconds
-
-    if actual_start_seconds is not None and actual_end_seconds is not None:
-        ydl_opts['postprocessor_args'] = [
-            '-ss', str(actual_start_seconds),
-            '-to', str(actual_end_seconds),
-        ]
-    else: # Default to first 30s if no specific range
-        actual_start_seconds = 0
-        actual_end_seconds = 30
-        ydl_opts['postprocessor_args'] = [
-             '-ss', str(actual_start_seconds),
-             '-to', str(actual_end_seconds)
-        ]
-
-    target_url = f"https://www.youtube.com/watch?v={video_id}"
-    video_info_dict = None
+    downloaded_file_path = None
+    video_info: Dict[str, Any] = {}
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                video_info_dict = ydl.extract_info(target_url, download=True) # Download and get info
-            except yt_dlp.utils.DownloadError as e:
-                if "Private video" in str(e) or "Video unavailable" in str(e):
-                     raise ValueError(f"Video is private or unavailable: {video_id}") from e
-                elif "Unsupported URL" in str(e):
-                     raise ValueError(f"Invalid or unsupported YouTube URL: {target_url}") from e
-                elif "age restricted" in str(e).lower():
-                     raise ValueError(f"Video is age-restricted: {target_url}") from e
-                print(f"yt-dlp download error for {target_url}: {e}")
-                raise # Re-raise other download errors to be caught by the generic Exception
-
-        if not video_info_dict:
-            print(f"Could not retrieve video information for {target_url}")
-            return None
-
-        # The actual downloaded file path might be slightly different if yt-dlp changed filename
-        # We assume it's the one we defined with .mp3 extension.
-        downloaded_file_path = final_output_mp3
-        if not os.path.exists(downloaded_file_path):
-             # Fallback: try to find it based on `video_info_dict` if possible
-            if '_filename' in video_info_dict and os.path.exists(video_info_dict['_filename']):
-                downloaded_file_path = video_info_dict['_filename']
-            else:
-                # Last resort: search for the file if the naming was unexpected
-                found_files = [os.path.join(TEMP_AUDIO_DIR, f) for f in os.listdir(TEMP_AUDIO_DIR) if f.startswith(output_base) and f.endswith('.mp3')]
+            logger.info(f"Attempting to download segment for {video_id} from {start_seconds}s to {end_seconds}s (duration: {segment_duration}s)")
+            info_dict = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+            
+            # Construct the expected filename. yt-dlp replaces the original extension with .mp3.
+            # We need to find which file was actually created.
+            # A simple way is to list files and find the one matching the video_id pattern if ydl.prepare_filename is tricky.
+            
+            # Try to get the filename from info_dict if possible, otherwise scan the directory
+            # This assumes yt-dlp has finished writing the file.
+            # The exact filename after postprocessing can be tricky.
+            # We'll assume the base name is `safe_video_id}_segment` and extension is `mp3`.
+            downloaded_file_path = os.path.join(output_dir, f"{safe_video_id}_segment.mp3")
+            
+            if not os.path.exists(downloaded_file_path):
+                logger.warning(f"Expected file {downloaded_file_path} not found after download attempt. Trying to find it by scanning directory...")
+                found_files = [f for f in os.listdir(output_dir) if safe_video_id in f and f.endswith(".mp3")]
                 if found_files:
-                    downloaded_file_path = sorted(found_files, key=os.path.getmtime, reverse=True)[0]
+                    downloaded_file_path = os.path.join(output_dir, found_files[0])
+                    logger.info(f"Found file by scanning: {downloaded_file_path}")
                 else:
-                    print(f"Error: Output MP3 file {final_output_mp3} not found after download attempt.")
-                    return None
-        
-        print(f"Audio segment downloaded/processed to: {downloaded_file_path}")
+                    logger.error(f"Could not find the downloaded MP3 segment for {safe_video_id} in {output_dir}")
+                    raise FileNotFoundError(f"Downloaded MP3 segment for {safe_video_id} not found.")
 
-        title = video_info_dict.get('title', 'Unknown Title')
-        artist = video_info_dict.get('artist') or video_info_dict.get('uploader') or 'Unknown Artist'
-        thumbnail_url = video_info_dict.get('thumbnail')
-        
-        m_start, s_start = divmod(actual_start_seconds, 60)
-        m_end, s_end = divmod(actual_end_seconds, 60)
-        segment_display_time = f"{int(m_start):02d}:{int(s_start):02d} - {int(m_end):02d}:{int(s_end):02d}"
+            video_info = {
+                "file_path": downloaded_file_path,
+                "title": info_dict.get('title', "Unknown Title"),
+                "artist": info_dict.get('artist') or info_dict.get('uploader') or "Unknown Artist",
+                "album": info_dict.get('album', "Unknown Album"),
+                "thumbnail_url": info_dict.get('thumbnail'),
+                "original_url": f"https://www.youtube.com/watch?v={video_id}",
+                "duration_seconds": segment_duration, 
+                "start_time_seconds": start_seconds,
+                "end_time_seconds": end_seconds,
+                "segment_display_time": f"{start_seconds//60:02d}:{start_seconds%60:02d} - {end_seconds//60:02d}:{end_seconds%60:02d}"
+            }
+            logger.info(f"Successfully processed segment: {video_info.get('title')}, saved to {video_info.get('file_path')}")
 
-        return {
-            "file_path": downloaded_file_path,
-            "video_id": video_id,
-            "title": title,
-            "artist": artist,
-            "thumbnail_url": thumbnail_url,
-            "requested_start_s": actual_start_seconds,
-            "requested_end_s": actual_end_seconds,
-            "segment_display_time": segment_display_time,
-            "original_url": target_url
-        }
-
-    except ValueError as ve: # Catch our specific ValueErrors raised above
-        print(f"Value error during YouTube processing: {ve}")
-        raise # Re-raise to be caught by the API endpoint handler
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"yt-dlp DownloadError for video ID {video_id}: {str(e)}")
+        error_str = str(e).lower()
+        if "video is unavailable" in error_str or \
+           "private video" in error_str or \
+           "премьера" in error_str or \
+           "this video is private" in error_str or \
+           "members-only content" in error_str:
+            raise ValueError(f"The video (ID: {video_id}) is unavailable, private, a premiere, or members-only.") from e
+        raise # Re-raise other download errors
+    except FileNotFoundError as e:
+        logger.error(f"File not found error during segment processing for {video_id}: {str(e)}")
+        raise
     except Exception as e:
-        print(f"An unexpected error occurred during YouTube download for {target_url}: {e}")
-        # Clean up potentially partially downloaded file if it exists
-        if os.path.exists(final_output_mp3):
-            try: os.remove(final_output_mp3)
-            except OSError as oe: print(f"Could not remove partial file {final_output_mp3}: {oe}")
-        raise HTTPException(status_code=500, detail=f"Failed to process YouTube link: {e}") from e
+        logger.error(f"An unexpected error occurred in download_youtube_segment for video ID {video_id}: {str(e)}")
+        raise
+
+    return video_info
 
 if __name__ == '__main__':
     # --- Test functions ---
     test_urls = [
-        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "Rick Astley - Never Gonna Give You Up"),
-        ("https://www.youtube.com/watch?v=ZyhrYis509A&t=70s", "Beethoven - Moonlight Sonata (3rd Movement)"),
-        ("https://www.youtube.com/watch?v=3JZ_D3ELwOQ&t=1m35s", "Interstellar Main Theme"),
-        ("https://youtu.be/hKBMLrHjS3G8?t=60", "Shortform video with timestamp"), # Corrected: removed invalid char
-        # ("https://www.youtube.com/watch?v=nonexistentvideo", "Non-existent video"), # This will raise an error
-        # ("https://www.example.com", "Not a youtube video") # This will fail parsing
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "Standard, 0-20s"),
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=30s", "Start at 30s, 30-50s"),
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1m5s", "Start at 1m5s (65s), 65-85s"),
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=10s&end=25s", "10s to 25s (15s duration)"),
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=10s&end=15s", "10s to 15s (5s duration)"),
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=10s&end=40s", "10s to 40s (expect 10-30s, capped at 20s duration)"),
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ&end=10s", "Only end time 10s (expect 0-20s with current logic)"),
+        ("https://youtu.be/dQw4w9WgXcQ?t=5s", "Short URL, start 5s, 5-25s"),
+        ("https://www.youtube.com/watch?v=non_existent_video_id_123", "Non-existent video"), # Expected to fail
+        # ("https://www.youtube.com/watch?v= रुपए ", "Video with unicode that might be problematic for filenames - ID: रुपए"), # Example with unicode in ID. `safe_video_id` handles this.
+        ("https://www.youtube.com/watch?v=video_is_private", "Private video placeholder ID - needs actual private video to test")
     ]
 
     print("--- Testing URL Parsing and Downloading ---")
@@ -205,8 +236,6 @@ if __name__ == '__main__':
                     print(f"  Failed to process {name} (no download info returned).")
             except ValueError as ve:
                 print(f"  Skipping download due to parsing/video error: {ve}")
-            except HTTPException as he:
-                print(f"  HTTPException during download: {he.detail}")
             except Exception as e_main_test:
                 print(f"  Unhandled error during download test for {name}: {e_main_test}")
         else:
