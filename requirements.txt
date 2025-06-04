@@ -3,6 +3,9 @@ uvicorn[standard]
 python-multipart
 yt-dlp
 librosa
+openl3
+soundfile
+tensorflow
 # For Firebase integration (add later when setting up Firebase)
 # firebase-admin
 # numpy # librosa dependency, often good to specify

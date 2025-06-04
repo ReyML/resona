@@ -15,6 +15,7 @@ from pydantic import BaseModel # Ensure BaseModel is imported early
 # --- Service Imports ---
 # Assuming services directory is at the same level as main.py
 from services.youtube_service import parse_youtube_url, download_youtube_segment
+from services.audio_processor import process_audio_segment
 
 # --- Application Setup ---
 app = FastAPI(
@@ -65,6 +66,7 @@ class SegmentInfo(BaseModel):
     segment_display_time: str # e.g., "01:10 - 01:40"
     matched_features: List[str] = []
     similarity_score: Optional[float] = None
+    embedding: Optional[List[float]] = None
 
 class AnalysisResponse(BaseModel):
     source_segment_info: SegmentInfo
@@ -93,7 +95,17 @@ async def analyze_youtube_segment_endpoint(request_data: SegmentAnalysisRequest 
         if not download_info or not download_info.get("file_path"):
             raise HTTPException(status_code=500, detail="Failed to download or process YouTube segment.")
 
-        print(f"API: Segment downloaded: {download_info.get('file_path')}")
+        file_path_for_processing = download_info.get("file_path")
+        print(f"API: Segment downloaded: {file_path_for_processing}")
+
+        # Process audio to get embedding
+        segment_embedding = None
+        if file_path_for_processing:
+            segment_embedding = process_audio_segment(file_path_for_processing)
+            if segment_embedding:
+                print(f"API: Embedding generated for {file_path_for_processing}. Dimension: {len(segment_embedding)}")
+            else:
+                print(f"API: Failed to generate embedding for {file_path_for_processing}.")
 
         source_segment = SegmentInfo(
             id=f"yt_{video_id}_{start_s if start_s is not None else 0}_{end_s if end_s is not None else 'end'}",
@@ -102,7 +114,8 @@ async def analyze_youtube_segment_endpoint(request_data: SegmentAnalysisRequest 
             youtube_link=download_info.get("original_url", youtube_url),
             thumbnail_url=download_info.get("thumbnail_url"),
             segment_display_time=download_info.get("segment_display_time", "N/A"),
-            matched_features=["YouTube Segment", f"Duration: {(end_s if end_s else 0) - (start_s if start_s else 0)}s"]
+            matched_features=["YouTube Segment", f"Duration: {(end_s if end_s else 0) - (start_s if start_s else 0)}s"],
+            embedding=segment_embedding
         )
         
         similar_segments_placeholder = [
@@ -119,11 +132,12 @@ async def analyze_youtube_segment_endpoint(request_data: SegmentAnalysisRequest 
         ]
 
         try:
-            if os.path.exists(download_info["file_path"]):
-                os.remove(download_info["file_path"])
-                print(f"API: Cleaned up temporary file: {download_info['file_path']}")
+            # Ensure cleanup happens for the correct path
+            if file_path_for_processing and os.path.exists(file_path_for_processing):
+                os.remove(file_path_for_processing)
+                print(f"API: Cleaned up temporary file: {file_path_for_processing}")
         except Exception as e_clean:
-            print(f"API: Error cleaning up file {download_info.get('file_path')}: {e_clean}")
+            print(f"API: Error cleaning up file {file_path_for_processing}: {e_clean}")
 
         return AnalysisResponse(source_segment_info=source_segment, similar_segments=similar_segments_placeholder)
 
@@ -151,14 +165,24 @@ async def analyze_audio_file_endpoint(audio_file: UploadFile = File(...)):
     finally:
         audio_file.file.close()
 
+    # Process uploaded audio to get embedding
+    segment_embedding_upload = None
+    if os.path.exists(file_path):
+        segment_embedding_upload = process_audio_segment(file_path)
+        if segment_embedding_upload:
+            print(f"API: Embedding generated for uploaded file {audio_file.filename}. Dimension: {len(segment_embedding_upload)}")
+        else:
+            print(f"API: Failed to generate embedding for uploaded file {audio_file.filename}.")
+
     source_info_placeholder = SegmentInfo(
         id=f"upload_{audio_file.filename.split('.')[0]}_{int(os.path.getmtime(file_path))}", 
         title=audio_file.filename, 
         artist="Uploaded Audio", 
         youtube_link="#", 
-        thumbnail_url="https://via.placeholder.com/400x225/777/fff?text=Audio+File",
+        thumbnail_url="https://placehold.co/400x225/777/fff?text=Audio+File",
         segment_display_time="Full duration",
-        matched_features=["Uploaded File", "Local Analysis"]
+        matched_features=["Uploaded File", "Local Analysis"],
+        embedding=segment_embedding_upload
     )
     similar_segments_placeholder = [] 
     
